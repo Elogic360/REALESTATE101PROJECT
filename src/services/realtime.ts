@@ -1,111 +1,351 @@
-import { supabase, subscribeToTable } from '../lib/supabase';
+import { SubscriptionManager } from '../lib/supabase';
 import { LandPlot, Order } from '../types';
 
 export class RealtimeService {
-  private static subscriptions: Map<string, any> = new Map();
+  private static isInitialized = false;
+  private static userSubscriptions = new Set<string>();
+
+  // Initialize real-time service
+  static initialize() {
+    if (this.isInitialized) return;
+    
+    this.isInitialized = true;
+    
+    // Listen for auth state changes to manage subscriptions
+    window.addEventListener('auth:login', (event: any) => {
+      this.setupUserSubscriptions(event.detail.userId);
+    });
+    
+    window.addEventListener('auth:logout', () => {
+      this.cleanupUserSubscriptions();
+    });
+    
+    window.addEventListener('auth:session-expired', () => {
+      this.cleanupUserSubscriptions();
+    });
+  }
+
+  // Setup subscriptions for authenticated user
+  static setupUserSubscriptions(userId: string) {
+    this.cleanupUserSubscriptions();
+    
+    // Subscribe to user's notifications
+    this.subscribeToUserNotifications(userId, (payload) => {
+      this.handleNotificationUpdate(payload);
+    });
+    
+    // Subscribe to user's orders
+    this.subscribeToUserOrders(userId, (payload) => {
+      this.handleOrderUpdate(payload);
+    });
+    
+    // Subscribe to user's cart
+    this.subscribeToUserCart(userId, (payload) => {
+      this.handleCartUpdate(payload);
+    });
+    
+    // Subscribe to property updates (for all users)
+    this.subscribeToProperties((payload) => {
+      this.handlePropertyUpdate(payload);
+    });
+  }
+
+  // Cleanup user-specific subscriptions
+  static cleanupUserSubscriptions() {
+    this.userSubscriptions.forEach(key => {
+      SubscriptionManager.unsubscribe(key);
+    });
+    this.userSubscriptions.clear();
+  }
 
   // Subscribe to property updates
   static subscribeToProperties(callback: (payload: any) => void) {
-    const subscription = subscribeToTable('land_plots', (payload) => {
-      console.log('Property update:', payload);
-      callback(payload);
-    });
-
-    this.subscriptions.set('properties', subscription);
-    return subscription;
+    const key = 'properties';
+    
+    SubscriptionManager.subscribe(
+      key,
+      'land_plots',
+      (payload) => {
+        console.log('Property update:', payload);
+        callback(payload);
+        
+        // Dispatch custom events for different types of updates
+        if (payload.eventType === 'UPDATE' && payload.old?.status !== payload.new?.status) {
+          window.dispatchEvent(new CustomEvent('property:status-changed', {
+            detail: {
+              plotId: payload.new.id,
+              oldStatus: payload.old.status,
+              newStatus: payload.new.status
+            }
+          }));
+        }
+      },
+      undefined,
+      { event: '*' }
+    );
+    
+    return key;
   }
 
-  // Subscribe to user's orders
+  // Subscribe to user's orders with enhanced filtering
   static subscribeToUserOrders(userId: string, callback: (payload: any) => void) {
-    const subscription = subscribeToTable('orders', (payload) => {
-      console.log('Order update:', payload);
-      if (payload.new?.user_id === userId || payload.old?.user_id === userId) {
-        callback(payload);
-      }
-    }, `user_id=eq.${userId}`);
-
-    this.subscriptions.set(`orders_${userId}`, subscription);
-    return subscription;
+    const key = `orders_${userId}`;
+    this.userSubscriptions.add(key);
+    
+    SubscriptionManager.subscribe(
+      key,
+      'orders',
+      (payload) => {
+        console.log('Order update:', payload);
+        
+        // Only process if it's for this user
+        if (payload.new?.user_id === userId || payload.old?.user_id === userId) {
+          callback(payload);
+          
+          // Dispatch specific events
+          if (payload.eventType === 'INSERT') {
+            window.dispatchEvent(new CustomEvent('order:created', {
+              detail: { order: payload.new }
+            }));
+          } else if (payload.eventType === 'UPDATE') {
+            window.dispatchEvent(new CustomEvent('order:updated', {
+              detail: { 
+                order: payload.new,
+                changes: this.getChanges(payload.old, payload.new)
+              }
+            }));
+          }
+        }
+      },
+      `user_id=eq.${userId}`,
+      { event: '*' }
+    );
+    
+    return key;
   }
 
   // Subscribe to user's notifications
   static subscribeToUserNotifications(userId: string, callback: (payload: any) => void) {
-    const subscription = subscribeToTable('notifications', (payload) => {
-      console.log('Notification update:', payload);
-      if (payload.new?.user_id === userId || payload.old?.user_id === userId) {
-        callback(payload);
-      }
-    }, `user_id=eq.${userId}`);
-
-    this.subscriptions.set(`notifications_${userId}`, subscription);
-    return subscription;
+    const key = `notifications_${userId}`;
+    this.userSubscriptions.add(key);
+    
+    SubscriptionManager.subscribe(
+      key,
+      'notifications',
+      (payload) => {
+        console.log('Notification update:', payload);
+        
+        if (payload.new?.user_id === userId || payload.old?.user_id === userId) {
+          callback(payload);
+          
+          // Show toast notification for new notifications
+          if (payload.eventType === 'INSERT' && payload.new) {
+            this.showToastNotification(payload.new);
+          }
+        }
+      },
+      `user_id=eq.${userId}`,
+      { event: '*' }
+    );
+    
+    return key;
   }
 
-  // Subscribe to cart updates
+  // Subscribe to user's cart
   static subscribeToUserCart(userId: string, callback: (payload: any) => void) {
-    const subscription = subscribeToTable('cart_items', (payload) => {
-      console.log('Cart update:', payload);
-      if (payload.new?.user_id === userId || payload.old?.user_id === userId) {
-        callback(payload);
-      }
-    }, `user_id=eq.${userId}`);
-
-    this.subscriptions.set(`cart_${userId}`, subscription);
-    return subscription;
+    const key = `cart_${userId}`;
+    this.userSubscriptions.add(key);
+    
+    SubscriptionManager.subscribe(
+      key,
+      'cart_items',
+      (payload) => {
+        console.log('Cart update:', payload);
+        
+        if (payload.new?.user_id === userId || payload.old?.user_id === userId) {
+          callback(payload);
+          
+          // Update cart badge count
+          window.dispatchEvent(new CustomEvent('cart:updated', {
+            detail: { payload }
+          }));
+        }
+      },
+      `user_id=eq.${userId}`,
+      { event: '*' }
+    );
+    
+    return key;
   }
 
   // Subscribe to all orders (admin only)
   static subscribeToAllOrders(callback: (payload: any) => void) {
-    const subscription = subscribeToTable('orders', (payload) => {
-      console.log('All orders update:', payload);
-      callback(payload);
-    });
+    const key = 'all_orders';
+    
+    SubscriptionManager.subscribe(
+      key,
+      'orders',
+      (payload) => {
+        console.log('All orders update:', payload);
+        callback(payload);
+        
+        // Admin-specific events
+        if (payload.eventType === 'INSERT') {
+          window.dispatchEvent(new CustomEvent('admin:new-order', {
+            detail: { order: payload.new }
+          }));
+        }
+      },
+      undefined,
+      { event: '*' }
+    );
+    
+    return key;
+  }
 
-    this.subscriptions.set('all_orders', subscription);
-    return subscription;
+  // Subscribe to all profiles (master admin only)
+  static subscribeToAllProfiles(callback: (payload: any) => void) {
+    const key = 'all_profiles';
+    
+    SubscriptionManager.subscribe(
+      key,
+      'profiles',
+      (payload) => {
+        console.log('Profile update:', payload);
+        callback(payload);
+        
+        // Master admin events
+        if (payload.eventType === 'INSERT') {
+          window.dispatchEvent(new CustomEvent('admin:new-user', {
+            detail: { user: payload.new }
+          }));
+        }
+      },
+      undefined,
+      { event: '*' }
+    );
+    
+    return key;
   }
 
   // Unsubscribe from specific subscription
   static unsubscribe(key: string) {
-    const subscription = this.subscriptions.get(key);
-    if (subscription) {
-      supabase.removeChannel(subscription);
-      this.subscriptions.delete(key);
-    }
+    SubscriptionManager.unsubscribe(key);
+    this.userSubscriptions.delete(key);
   }
 
   // Unsubscribe from all subscriptions
   static unsubscribeAll() {
-    this.subscriptions.forEach((subscription, key) => {
-      supabase.removeChannel(subscription);
+    SubscriptionManager.unsubscribeAll();
+    this.userSubscriptions.clear();
+  }
+
+  // Get active subscriptions
+  static getActiveSubscriptions() {
+    return SubscriptionManager.getActiveSubscriptions();
+  }
+
+  // Handle notification updates
+  private static handleNotificationUpdate(payload: any) {
+    if (payload.eventType === 'INSERT' && payload.new) {
+      // Update notification count in UI
+      const event = new CustomEvent('notification:new', {
+        detail: { notification: payload.new }
+      });
+      window.dispatchEvent(event);
+    }
+  }
+
+  // Handle order updates
+  private static handleOrderUpdate(payload: any) {
+    if (payload.eventType === 'UPDATE' && payload.new && payload.old) {
+      const changes = this.getChanges(payload.old, payload.new);
+      
+      // Notify about status changes
+      if (changes.status) {
+        const event = new CustomEvent('order:status-changed', {
+          detail: {
+            orderId: payload.new.id,
+            oldStatus: payload.old.status,
+            newStatus: payload.new.status
+          }
+        });
+        window.dispatchEvent(event);
+      }
+      
+      // Notify about payment status changes
+      if (changes.payment_status) {
+        const event = new CustomEvent('order:payment-status-changed', {
+          detail: {
+            orderId: payload.new.id,
+            oldPaymentStatus: payload.old.payment_status,
+            newPaymentStatus: payload.new.payment_status
+          }
+        });
+        window.dispatchEvent(event);
+      }
+    }
+  }
+
+  // Handle cart updates
+  private static handleCartUpdate(payload: any) {
+    // Update cart count in header
+    const event = new CustomEvent('cart:count-changed', {
+      detail: { payload }
     });
-    this.subscriptions.clear();
+    window.dispatchEvent(event);
   }
 
-  // Get active subscriptions count
-  static getActiveSubscriptionsCount(): number {
-    return this.subscriptions.size;
+  // Handle property updates
+  private static handlePropertyUpdate(payload: any) {
+    if (payload.eventType === 'UPDATE' && payload.new && payload.old) {
+      // Notify about status changes
+      if (payload.old.status !== payload.new.status) {
+        const event = new CustomEvent('property:availability-changed', {
+          detail: {
+            plotId: payload.new.id,
+            oldStatus: payload.old.status,
+            newStatus: payload.new.status
+          }
+        });
+        window.dispatchEvent(event);
+      }
+    }
   }
 
-  // Check if subscription exists
-  static hasSubscription(key: string): boolean {
-    return this.subscriptions.has(key);
+  // Show toast notification
+  private static showToastNotification(notification: any) {
+    // Create a custom event that the UI can listen to
+    const event = new CustomEvent('toast:show', {
+      detail: {
+        title: notification.title,
+        message: notification.message,
+        type: notification.type || 'info'
+      }
+    });
+    window.dispatchEvent(event);
   }
-}
 
-// Real-time event types
-export interface RealtimeEvent {
-  eventType: 'INSERT' | 'UPDATE' | 'DELETE';
-  schema: string;
-  table: string;
-  commit_timestamp: string;
-  new?: any;
-  old?: any;
+  // Get changes between old and new records
+  private static getChanges(oldRecord: any, newRecord: any): Record<string, any> {
+    const changes: Record<string, any> = {};
+    
+    Object.keys(newRecord).forEach(key => {
+      if (oldRecord[key] !== newRecord[key]) {
+        changes[key] = {
+          old: oldRecord[key],
+          new: newRecord[key]
+        };
+      }
+    });
+    
+    return changes;
+  }
 }
 
 // Property-specific real-time handlers
 export class PropertyRealtimeHandlers {
-  static handlePropertyUpdate(event: RealtimeEvent, onUpdate: (property: LandPlot) => void) {
+  static handlePropertyUpdate(event: any, onUpdate: (property: LandPlot) => void) {
     if (event.eventType === 'UPDATE' && event.new) {
       const updatedProperty = this.transformPropertyData(event.new);
       onUpdate(updatedProperty);
@@ -113,7 +353,7 @@ export class PropertyRealtimeHandlers {
   }
 
   static handlePropertyStatusChange(
-    event: RealtimeEvent, 
+    event: any, 
     onStatusChange: (plotId: string, newStatus: string, oldStatus: string) => void
   ) {
     if (event.eventType === 'UPDATE' && event.new && event.old) {
@@ -154,7 +394,7 @@ export class PropertyRealtimeHandlers {
 
 // Order-specific real-time handlers
 export class OrderRealtimeHandlers {
-  static handleOrderUpdate(event: RealtimeEvent, onUpdate: (order: Order) => void) {
+  static handleOrderUpdate(event: any, onUpdate: (order: Order) => void) {
     if (event.eventType === 'UPDATE' && event.new) {
       // Note: This would need to fetch the related plot data
       // In a real implementation, you might want to use a view or join
@@ -172,7 +412,7 @@ export class OrderRealtimeHandlers {
     }
   }
 
-  static handleNewOrder(event: RealtimeEvent, onNewOrder: (order: Order) => void) {
+  static handleNewOrder(event: any, onNewOrder: (order: Order) => void) {
     if (event.eventType === 'INSERT' && event.new) {
       // Similar to handleOrderUpdate, would need plot data
       onNewOrder({
@@ -189,3 +429,6 @@ export class OrderRealtimeHandlers {
     }
   }
 }
+
+// Initialize the service
+RealtimeService.initialize();

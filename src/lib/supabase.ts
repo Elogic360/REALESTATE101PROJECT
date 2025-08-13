@@ -7,22 +7,161 @@ if (!supabaseUrl || !supabaseAnonKey) {
   throw new Error('Missing Supabase environment variables. Please check your .env file.');
 }
 
+// Enhanced Supabase client with production-ready configuration
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
     autoRefreshToken: true,
     persistSession: true,
     detectSessionInUrl: true,
-    flowType: 'pkce'
+    flowType: 'pkce',
+    storage: typeof window !== 'undefined' ? window.localStorage : undefined,
+    storageKey: 'tanzland-auth-token',
+    debug: import.meta.env.DEV
   },
   realtime: {
     params: {
-      eventsPerSecond: 10
-    }
+      eventsPerSecond: 10,
+      timeout: 30000,
+      heartbeatIntervalMs: 30000
+    },
+    transport: 'websocket',
+    timeout: 30000
   },
   db: {
     schema: 'public'
+  },
+  global: {
+    headers: {
+      'X-Client-Info': 'tanzland-web-app'
+    }
   }
 });
+
+// Connection pool management for production
+let connectionAttempts = 0;
+const MAX_CONNECTION_ATTEMPTS = 3;
+
+// Enhanced connection health monitoring
+export const monitorConnection = () => {
+  const checkInterval = setInterval(async () => {
+    const isHealthy = await checkConnection();
+    if (!isHealthy) {
+      connectionAttempts++;
+      console.warn(`Connection unhealthy. Attempt ${connectionAttempts}/${MAX_CONNECTION_ATTEMPTS}`);
+      
+      if (connectionAttempts >= MAX_CONNECTION_ATTEMPTS) {
+        console.error('Max connection attempts reached. Implementing fallback strategy.');
+        // Implement fallback strategy (offline mode, retry logic, etc.)
+        clearInterval(checkInterval);
+      }
+    } else {
+      connectionAttempts = 0; // Reset on successful connection
+    }
+  }, 60000); // Check every minute
+
+  return () => clearInterval(checkInterval);
+};
+
+// Enhanced real-time subscription management
+export class SubscriptionManager {
+  private static subscriptions = new Map<string, any>();
+  private static reconnectAttempts = new Map<string, number>();
+  private static readonly MAX_RECONNECT_ATTEMPTS = 5;
+
+  static subscribe(
+    key: string,
+    table: keyof Database['public']['Tables'],
+    callback: (payload: any) => void,
+    filter?: string,
+    options?: {
+      event?: 'INSERT' | 'UPDATE' | 'DELETE' | '*';
+      schema?: string;
+    }
+  ) {
+    // Clean up existing subscription
+    this.unsubscribe(key);
+
+    const channel = supabase.channel(`${key}-${Date.now()}`);
+    
+    const subscription = channel
+      .on('postgres_changes', {
+        event: options?.event || '*',
+        schema: options?.schema || 'public',
+        table: table as string,
+        filter: filter
+      }, (payload) => {
+        try {
+          callback(payload);
+          // Reset reconnect attempts on successful message
+          this.reconnectAttempts.set(key, 0);
+        } catch (error) {
+          console.error(`Error in subscription callback for ${key}:`, error);
+        }
+      })
+      .on('system', {}, (payload) => {
+        if (payload.status === 'CHANNEL_ERROR') {
+          this.handleSubscriptionError(key, table, callback, filter, options);
+        }
+      })
+      .subscribe((status) => {
+        console.log(`Subscription ${key} status:`, status);
+        if (status === 'SUBSCRIBED') {
+          console.log(`Successfully subscribed to ${key}`);
+        } else if (status === 'CHANNEL_ERROR') {
+          this.handleSubscriptionError(key, table, callback, filter, options);
+        }
+      });
+
+    this.subscriptions.set(key, subscription);
+    return subscription;
+  }
+
+  private static handleSubscriptionError(
+    key: string,
+    table: keyof Database['public']['Tables'],
+    callback: (payload: any) => void,
+    filter?: string,
+    options?: any
+  ) {
+    const attempts = this.reconnectAttempts.get(key) || 0;
+    
+    if (attempts < this.MAX_RECONNECT_ATTEMPTS) {
+      this.reconnectAttempts.set(key, attempts + 1);
+      
+      // Exponential backoff
+      const delay = Math.pow(2, attempts) * 1000;
+      
+      setTimeout(() => {
+        console.log(`Attempting to reconnect subscription ${key} (attempt ${attempts + 1})`);
+        this.subscribe(key, table, callback, filter, options);
+      }, delay);
+    } else {
+      console.error(`Max reconnection attempts reached for subscription ${key}`);
+      this.reconnectAttempts.delete(key);
+    }
+  }
+
+  static unsubscribe(key: string) {
+    const subscription = this.subscriptions.get(key);
+    if (subscription) {
+      supabase.removeChannel(subscription);
+      this.subscriptions.delete(key);
+      this.reconnectAttempts.delete(key);
+    }
+  }
+
+  static unsubscribeAll() {
+    this.subscriptions.forEach((subscription, key) => {
+      supabase.removeChannel(subscription);
+    });
+    this.subscriptions.clear();
+    this.reconnectAttempts.clear();
+  }
+
+  static getActiveSubscriptions() {
+    return Array.from(this.subscriptions.keys());
+  }
+}
 
 // Database types for better TypeScript support
 export interface Database {
@@ -236,64 +375,162 @@ export interface Database {
   };
 }
 
-// Real-time subscription helpers
-export const subscribeToTable = (
-  table: keyof Database['public']['Tables'],
-  callback: (payload: any) => void,
-  filter?: string
-) => {
-  let subscription = supabase
-    .channel(`public:${table}`)
-    .on('postgres_changes', 
-      { 
-        event: '*', 
-        schema: 'public', 
-        table: table,
-        filter: filter 
-      }, 
-      callback
-    )
-    .subscribe();
-
-  return subscription;
+// Enhanced connection health check with retry logic
+export const checkConnection = async (retries: number = 3): Promise<boolean> => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('id')
+        .limit(1);
+      
+      if (!error) return true;
+      
+      if (i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+      }
+    } catch (error) {
+      console.error(`Connection check attempt ${i + 1} failed:`, error);
+      if (i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+      }
+    }
+  }
+  return false;
 };
 
-// Connection health check
-export const checkConnection = async (): Promise<boolean> => {
-  try {
-    const { data, error } = await supabase.from('profiles').select('id').limit(1);
-    return !error;
-  } catch (error) {
-    console.error('Supabase connection error:', error);
-    return false;
+// Enhanced session management with automatic refresh
+export const SessionManager = {
+  refreshTimer: null as NodeJS.Timeout | null,
+  
+  startAutoRefresh() {
+    this.stopAutoRefresh();
+    
+    // Refresh session every 50 minutes (tokens expire after 1 hour)
+    this.refreshTimer = setInterval(async () => {
+      try {
+        const { data, error } = await supabase.auth.refreshSession();
+        if (error) {
+          console.error('Session refresh failed:', error);
+          // Trigger re-authentication flow
+          window.dispatchEvent(new CustomEvent('auth:session-expired'));
+        } else {
+          console.log('Session refreshed successfully');
+        }
+      } catch (error) {
+        console.error('Session refresh error:', error);
+      }
+    }, 50 * 60 * 1000);
+  },
+  
+  stopAutoRefresh() {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
   }
 };
 
-// Session management
-export const getCurrentSession = async () => {
-  const { data: { session }, error } = await supabase.auth.getSession();
-  if (error) {
-    console.error('Error getting session:', error);
-    return null;
-  }
-  return session;
-};
-
-// Enhanced error handling
-export const handleSupabaseError = (error: any) => {
+// Production-ready error handling
+export const handleSupabaseError = (error: any): string => {
   console.error('Supabase error:', error);
   
-  if (error?.code === 'PGRST116') {
-    return 'No data found';
+  // Network errors
+  if (error?.message?.includes('fetch')) {
+    return 'Network connection error. Please check your internet connection.';
   }
   
+  // Authentication errors
+  if (error?.message?.includes('JWT') || error?.message?.includes('token')) {
+    return 'Session expired. Please log in again.';
+  }
+  
+  // Database constraint errors
   if (error?.code === '23505') {
-    return 'This record already exists';
+    return 'This record already exists.';
   }
   
-  if (error?.code === '42501') {
-    return 'You do not have permission to perform this action';
+  if (error?.code === '23503') {
+    return 'Cannot delete this record as it is referenced by other data.';
   }
   
-  return error?.message || 'An unexpected error occurred';
+  // Permission errors
+  if (error?.code === '42501' || error?.message?.includes('permission')) {
+    return 'You do not have permission to perform this action.';
+  }
+  
+  // Row Level Security errors
+  if (error?.code === 'PGRST301') {
+    return 'Access denied. Please ensure you have the required permissions.';
+  }
+  
+  // Not found errors
+  if (error?.code === 'PGRST116') {
+    return 'Record not found.';
+  }
+  
+  // Rate limiting
+  if (error?.message?.includes('rate limit')) {
+    return 'Too many requests. Please wait a moment and try again.';
+  }
+  
+  // Generic fallback
+  return error?.message || 'An unexpected error occurred. Please try again.';
 };
+
+// Database performance monitoring
+export const PerformanceMonitor = {
+  queryTimes: new Map<string, number[]>(),
+  
+  startQuery(queryKey: string): () => void {
+    const startTime = performance.now();
+    
+    return () => {
+      const endTime = performance.now();
+      const duration = endTime - startTime;
+      
+      if (!this.queryTimes.has(queryKey)) {
+        this.queryTimes.set(queryKey, []);
+      }
+      
+      const times = this.queryTimes.get(queryKey)!;
+      times.push(duration);
+      
+      // Keep only last 100 measurements
+      if (times.length > 100) {
+        times.shift();
+      }
+      
+      // Log slow queries (> 2 seconds)
+      if (duration > 2000) {
+        console.warn(`Slow query detected: ${queryKey} took ${duration.toFixed(2)}ms`);
+      }
+    };
+  },
+  
+  getAverageQueryTime(queryKey: string): number {
+    const times = this.queryTimes.get(queryKey);
+    if (!times || times.length === 0) return 0;
+    
+    return times.reduce((sum, time) => sum + time, 0) / times.length;
+  },
+  
+  getAllStats() {
+    const stats: Record<string, { average: number; count: number; max: number }> = {};
+    
+    this.queryTimes.forEach((times, key) => {
+      stats[key] = {
+        average: this.getAverageQueryTime(key),
+        count: times.length,
+        max: Math.max(...times)
+      };
+    });
+    
+    return stats;
+  }
+};
+
+// Initialize connection monitoring in production
+if (import.meta.env.PROD) {
+  monitorConnection();
+}
