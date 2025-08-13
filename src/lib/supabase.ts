@@ -4,12 +4,27 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
-  throw new Error('Missing Supabase environment variables');
+  throw new Error('Missing Supabase environment variables. Please check your .env file.');
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: true,
+    detectSessionInUrl: true,
+    flowType: 'pkce'
+  },
+  realtime: {
+    params: {
+      eventsPerSecond: 10
+    }
+  },
+  db: {
+    schema: 'public'
+  }
+});
 
-// Database types
+// Database types for better TypeScript support
 export interface Database {
   public: {
     Tables: {
@@ -204,5 +219,81 @@ export interface Database {
         };
       };
     };
+    Views: {
+      [_ in never]: never;
+    };
+    Functions: {
+      [_ in never]: never;
+    };
+    Enums: {
+      user_role: 'user' | 'admin' | 'master_admin';
+      partner_status: 'pending' | 'approved' | 'rejected';
+      land_usage: 'economic' | 'business' | 'residential' | 'mixed';
+      plot_status: 'available' | 'reserved' | 'sold';
+      order_status: 'pending' | 'processing' | 'completed' | 'cancelled';
+      payment_status: 'pending' | 'completed' | 'failed';
+    };
   };
 }
+
+// Real-time subscription helpers
+export const subscribeToTable = (
+  table: keyof Database['public']['Tables'],
+  callback: (payload: any) => void,
+  filter?: string
+) => {
+  let subscription = supabase
+    .channel(`public:${table}`)
+    .on('postgres_changes', 
+      { 
+        event: '*', 
+        schema: 'public', 
+        table: table,
+        filter: filter 
+      }, 
+      callback
+    )
+    .subscribe();
+
+  return subscription;
+};
+
+// Connection health check
+export const checkConnection = async (): Promise<boolean> => {
+  try {
+    const { data, error } = await supabase.from('profiles').select('id').limit(1);
+    return !error;
+  } catch (error) {
+    console.error('Supabase connection error:', error);
+    return false;
+  }
+};
+
+// Session management
+export const getCurrentSession = async () => {
+  const { data: { session }, error } = await supabase.auth.getSession();
+  if (error) {
+    console.error('Error getting session:', error);
+    return null;
+  }
+  return session;
+};
+
+// Enhanced error handling
+export const handleSupabaseError = (error: any) => {
+  console.error('Supabase error:', error);
+  
+  if (error?.code === 'PGRST116') {
+    return 'No data found';
+  }
+  
+  if (error?.code === '23505') {
+    return 'This record already exists';
+  }
+  
+  if (error?.code === '42501') {
+    return 'You do not have permission to perform this action';
+  }
+  
+  return error?.message || 'An unexpected error occurred';
+};
